@@ -1,7 +1,5 @@
 import torch
 import torch.nn.functional as F
-from torch_geometric.nn import GCNConv
-from torch_geometric.data import Data
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
@@ -12,20 +10,36 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+class GraphConvolution(torch.nn.Module):
+    def __init__(self, in_features, out_features):
+        super(GraphConvolution, self).__init__()
+        self.weight = torch.nn.Parameter(torch.FloatTensor(in_features, out_features))
+        self.bias = torch.nn.Parameter(torch.FloatTensor(out_features))
+        self.reset_parameters()
+    
+    def reset_parameters(self):
+        torch.nn.init.xavier_uniform_(self.weight)
+        torch.nn.init.zeros_(self.bias)
+    
+    def forward(self, x, adj):
+        support = torch.mm(x, self.weight)
+        output = torch.spmm(adj, support)
+        return output + self.bias
+
+
 class SimulationGCN(torch.nn.Module):
     def __init__(self, in_feats, hidden=64, out_feats=1, dropout=0.2):
         super().__init__()
-        self.conv1 = GCNConv(in_feats, hidden)
-        self.conv2 = GCNConv(hidden, hidden)
+        self.gc1 = GraphConvolution(in_feats, hidden)
+        self.gc2 = GraphConvolution(hidden, hidden)
         self.lin = torch.nn.Linear(hidden, out_feats)
         self.dropout = torch.nn.Dropout(dropout)
 
-    def forward(self, data):
-        x, edge_index = data.x, data.edge_index
-        x = self.conv1(x, edge_index)
+    def forward(self, x, adj):
+        x = self.gc1(x, adj)
         x = F.relu(x)
         x = self.dropout(x)
-        x = self.conv2(x, edge_index)
+        x = self.gc2(x, adj)
         x = F.relu(x)
         x = self.lin(x)
         return x
@@ -37,7 +51,7 @@ class HazeSimulator:
         self.model = None
         self.node_cities = []
         self.city_to_idx = {}
-        self.edge_index = None
+        self.adj_matrix = None
         self.feature_cols = [
             "temperature", "humidity", "wind_speed", "wind_direction",
             "avg_fire_confidence", "upwind_fire_count", "current_aqi", "population_density"
@@ -60,8 +74,10 @@ class HazeSimulator:
         try:
             self.node_cities = list(node_data['city'].unique())
             self.city_to_idx = {c: i for i, c in enumerate(self.node_cities)}
+            num_nodes = len(self.node_cities)
             
-            edges = []
+            adj_matrix = np.zeros((num_nodes, num_nodes), dtype=np.float32)
+            
             for connection in city_graph:
                 src_city = connection.get('city')
                 src = self.city_to_idx.get(src_city)
@@ -78,13 +94,26 @@ class HazeSimulator:
                         continue
                     dst = self.city_to_idx.get(c)
                     if dst is not None:
-                        edges.append([src, dst])
+                        adj_matrix[src][dst] = 1.0
+                        adj_matrix[dst][src] = 1.0
             
-            if len(edges) == 0:
-                raise ValueError("No valid edges created from city graph")
+            adj_matrix = adj_matrix + np.eye(num_nodes)
             
-            self.edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
-            logger.info(f"Graph initialized with {len(self.node_cities)} nodes and {len(edges)} edges")
+            degree = np.sum(adj_matrix, axis=1)
+            degree_inv_sqrt = np.power(degree, -0.5)
+            degree_inv_sqrt[np.isinf(degree_inv_sqrt)] = 0.0
+            degree_matrix = np.diag(degree_inv_sqrt)
+            adj_normalized = degree_matrix @ adj_matrix @ degree_matrix
+            
+            indices = np.nonzero(adj_normalized)
+            values = adj_normalized[indices]
+            indices = torch.LongTensor(np.vstack(indices))
+            values = torch.FloatTensor(values)
+            shape = torch.Size(adj_normalized.shape)
+            
+            self.adj_matrix = torch.sparse.FloatTensor(indices, values, shape).to(self.device)
+            
+            logger.info(f"Graph initialized with {num_nodes} nodes and {np.sum(adj_matrix > 0)} edges")
         except Exception as e:
             logger.error(f"Failed to initialize graph: {str(e)}")
             raise
@@ -120,8 +149,7 @@ class HazeSimulator:
             
             for h in range(1, hours + 1):
                 with torch.no_grad():
-                    data = Data(x=current_x, edge_index=self.edge_index)
-                    pred = self.model(data).cpu().numpy().flatten()
+                    pred = self.model(current_x, self.adj_matrix).cpu().numpy().flatten()
                 
                 pred = np.clip(pred, 0, 500)
                 
