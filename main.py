@@ -1,24 +1,23 @@
-import os
-import logging
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import Optional, List
+from pydantic import BaseModel, Field, validator
+from typing import List, Dict, Optional
+import pandas as pd
+import os
 from datetime import datetime
+import logging
 from supabase import create_client, Client
 
 from simulation_gnn_model import HazeSimulator
 
-# ---------------------------
-# Logging
-# ---------------------------
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("haze-radar")
+logger = logging.getLogger(__name__)
 
-# ---------------------------
-# FastAPI app
-# ---------------------------
-app = FastAPI(title="Haze Radar API")
+app = FastAPI(
+    title="HazeRadar Simulation API",
+    description="GNN-based haze propagation simulation for Indonesia",
+    version="1.0.0"
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -28,129 +27,211 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------------------------
-# Globals
-# ---------------------------
-supabase: Optional[Client] = None
-model: Optional[HazeSimulator] = None
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+MODEL_PATH = os.getenv("MODEL_PATH", "simulation_gcn_best.pt")
+
+simulator: Optional[HazeSimulator] = None
+supabase_client: Optional[Client] = None
 
 
-# ---------------------------
-# Lazy Supabase connection
-# ---------------------------
-def get_supabase() -> Client:
-    global supabase
-
-    if supabase is not None:
-        return supabase
-
-    url = os.getenv("SUPABASE_URL")
-    key = os.getenv("SUPABASE_KEY")
-
-    if not url or not key:
-        raise RuntimeError("Supabase environment variables are missing")
-
-    supabase = create_client(url, key)
-    logger.info("Supabase client initialized")
-    return supabase
+class FireZoneCoordinate(BaseModel):
+    latitude: float = Field(..., ge=-90, le=90)
+    longitude: float = Field(..., ge=-180, le=180)
 
 
-# ---------------------------
-# Startup event
-# ---------------------------
-@app.on_event("startup")
-def startup_event():
-    global model
-    logger.info("Starting application")
-
-    model = HazeSimulator()
-    logger.info("Haze GNN model loaded")
-
-
-# ---------------------------
-# Health check
-# ---------------------------
-@app.get("/")
-def root():
-    return {"status": "Haze Radar backend is running"}
-
-
-# ---------------------------
-# Request Models
-# ---------------------------
 class SimulationRequest(BaseModel):
-    city: str
-    humidity: float
-    temperature: float
-    wind_speed: float
-    pm25: float
-    pm10: float
+    fire_zone_coords: List[FireZoneCoordinate]
+    simulation_hours: int = Field(default=72, ge=1, le=168)
+    radius_km: float = Field(default=50.0, ge=10, le=200)
+
+    @validator('fire_zone_coords')
+    def validate_coords(cls, v):
+        if len(v) == 0:
+            raise ValueError("At least one coordinate must be provided")
+        if len(v) > 50:
+            raise ValueError("Maximum 50 coordinates allowed")
+        return v
 
 
-# ---------------------------
-# API Endpoints
-# ---------------------------
-@app.post("/simulate")
-def simulate(req: SimulationRequest):
+class SimulationResponse(BaseModel):
+    simulation_id: str
+    status: str
+    message: str
+    total_predictions: int
+    forecast_hours: int
+    predictions: List[Dict]
+
+
+class HealthCheckResponse(BaseModel):
+    status: str
+    model_loaded: bool
+    database_connected: bool
+    timestamp: str
+
+
+def get_supabase_client() -> Client:
+    global supabase_client
+    if supabase_client is None:
+        if not SUPABASE_URL or not SUPABASE_KEY:
+            raise HTTPException(status_code=500, detail="Supabase credentials not configured")
+        supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    return supabase_client
+
+
+def get_simulator() -> HazeSimulator:
+    global simulator
+    if simulator is None:
+        raise HTTPException(status_code=503, detail="Simulator not initialized")
+    return simulator
+
+
+@app.on_event("startup")
+async def startup_event():
+    global simulator
     try:
-        if model is None:
-            raise HTTPException(status_code=500, detail="Model not initialized")
-
-        result = model.run_simulation(
-            city=req.city,
-            humidity=req.humidity,
-            temperature=req.temperature,
-            wind_speed=req.wind_speed,
-            pm25=req.pm25,
-            pm10=req.pm10
-        )
-
-        return {
-            "city": req.city,
-            "prediction": result,
-            "timestamp": datetime.utcnow().isoformat()
-        }
-
+        logger.info("Starting HazeRadar Simulation API...")
+        
+        if not os.path.exists(MODEL_PATH):
+            logger.error(f"Model file not found: {MODEL_PATH}")
+            raise FileNotFoundError(f"Model file not found: {MODEL_PATH}")
+        
+        simulator = HazeSimulator(MODEL_PATH)
+        simulator.load_model(in_feats=8)
+        
+        supabase = get_supabase_client()
+        
+        city_graph_response = supabase.table("city_graph_structure").select("*").execute()
+        city_graph = city_graph_response.data
+        logger.info(f"Loaded {len(city_graph)} city connections")
+        
+        training_data_response = supabase.table("gnn_training_data").select("*").execute()
+        training_data = pd.DataFrame(training_data_response.data)
+        
+        training_data['timestamp'] = pd.to_datetime(training_data['timestamp'])
+        num_cols = [
+            "latitude", "longitude", "temperature", "humidity", "wind_speed",
+            "avg_fire_confidence", "upwind_fire_count", "current_aqi",
+            "population_density"
+        ]
+        training_data[num_cols] = training_data[num_cols].apply(pd.to_numeric, errors='coerce')
+        training_data.dropna(inplace=True)
+        
+        logger.info(f"Loaded {len(training_data)} training data rows")
+        
+        simulator.initialize_graph(city_graph, training_data)
+        
+        logger.info("Simulator initialized successfully")
+        
     except Exception as e:
-        logger.exception("Simulation error")
+        logger.error(f"Startup failed: {str(e)}")
+        raise
+
+
+@app.get("/", response_model=HealthCheckResponse)
+async def health_check():
+    return HealthCheckResponse(
+        status="healthy",
+        model_loaded=simulator is not None,
+        database_connected=supabase_client is not None,
+        timestamp=datetime.now().isoformat()
+    )
+
+
+@app.get("/api/cities")
+async def get_cities(sim: HazeSimulator = Depends(get_simulator)):
+    try:
+        supabase = get_supabase_client()
+        response = supabase.table("gnn_training_data").select("city, latitude, longitude").execute()
+        
+        cities_df = pd.DataFrame(response.data)
+        cities_unique = cities_df.groupby('city').first().reset_index()
+        
+        return {
+            "total_cities": len(cities_unique),
+            "cities": cities_unique.to_dict('records')
+        }
+    except Exception as e:
+        logger.error(f"Failed to fetch cities: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/store")
-def store_simulation(req: SimulationRequest):
+@app.post("/api/simulate", response_model=SimulationResponse)
+async def simulate_haze(
+    request: SimulationRequest,
+    sim: HazeSimulator = Depends(get_simulator)
+):
     try:
-        sb = get_supabase()
-
-        if model is None:
-            raise HTTPException(status_code=500, detail="Model not initialized")
-
-        prediction = model.run_simulation(
-            city=req.city,
-            humidity=req.humidity,
-            temperature=req.temperature,
-            wind_speed=req.wind_speed,
-            pm25=req.pm25,
-            pm10=req.pm10
+        logger.info(f"Starting simulation with {len(request.fire_zone_coords)} fire zones")
+        
+        supabase = get_supabase_client()
+        response = supabase.table("gnn_training_data").select("*").execute()
+        training_data = pd.DataFrame(response.data)
+        
+        training_data['timestamp'] = pd.to_datetime(training_data['timestamp'])
+        num_cols = [
+            "latitude", "longitude", "temperature", "humidity", "wind_speed",
+            "wind_direction", "avg_fire_confidence", "upwind_fire_count", 
+            "current_aqi", "population_density"
+        ]
+        training_data[num_cols] = training_data[num_cols].apply(pd.to_numeric, errors='coerce')
+        training_data.dropna(inplace=True)
+        
+        fire_coords = [coord.dict() for coord in request.fire_zone_coords]
+        
+        result_df = sim.simulate_fire_zone(
+            fire_zone_coords=fire_coords,
+            initial_features=training_data,
+            hours=request.simulation_hours
         )
-
-        payload = {
-            "city": req.city,
-            "humidity": req.humidity,
-            "temperature": req.temperature,
-            "wind_speed": req.wind_speed,
-            "pm25": req.pm25,
-            "pm10": req.pm10,
-            "prediction": prediction,
-            "created_at": datetime.utcnow().isoformat()
-        }
-
-        response = sb.table("haze_predictions").insert(payload).execute()
-
-        return {
-            "status": "stored",
-            "data": response.data
-        }
-
+        
+        predictions = result_df.to_dict('records')
+        for pred in predictions:
+            if 'timestamp' in pred and isinstance(pred['timestamp'], pd.Timestamp):
+                pred['timestamp'] = pred['timestamp'].isoformat()
+        
+        simulation_id = f"sim_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        
+        return SimulationResponse(
+            simulation_id=simulation_id,
+            status="success",
+            message=f"Simulation completed for {request.simulation_hours} hours",
+            total_predictions=len(predictions),
+            forecast_hours=request.simulation_hours,
+            predictions=predictions
+        )
+        
     except Exception as e:
-        logger.exception("Supabase insert failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Simulation failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Simulation failed: {str(e)}")
+
+
+@app.get("/api/simulation/{simulation_id}")
+async def get_simulation_results(simulation_id: str):
+    return {
+        "simulation_id": simulation_id,
+        "status": "completed",
+        "message": "Use POST /api/simulate to run new simulations"
+    }
+
+
+@app.get("/api/model/info")
+async def get_model_info(sim: HazeSimulator = Depends(get_simulator)):
+    return {
+        "model_type": "Graph Convolutional Network (GCN)",
+        "input_features": sim.feature_cols,
+        "num_cities": len(sim.node_cities),
+        "num_edges": sim.edge_index.shape[1] if sim.edge_index is not None else 0,
+        "device": str(sim.device)
+    }
+
+
+if __name__ == "__main__":
+    import uvicorn
+    try:
+        port = int(os.getenv("PORT", "8000"))
+    except (ValueError, TypeError):
+        port = 8000
+    
+    logger.info(f"Starting server on port {port}")
+    uvicorn.run(app, host="0.0.0.0", port=port)
