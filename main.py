@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator
 from typing import List, Dict, Optional
 import pandas as pd
 import os
@@ -9,14 +9,15 @@ import logging
 from supabase import create_client, Client
 
 from simulation_gnn_model import HazeSimulator
+from math import radians, sin, cos, sqrt, atan2
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="HazeRadar Simulation API",
-    description="GNN-based haze propagation simulation for Indonesia",
-    version="1.0.0"
+    description="GNN-based haze propagation simulation for West Java",
+    version="2.0.0"
 )
 
 app.add_middleware(
@@ -45,7 +46,8 @@ class SimulationRequest(BaseModel):
     simulation_hours: int = Field(default=72, ge=1, le=168)
     radius_km: float = Field(default=50.0, ge=10, le=200)
 
-    @validator('fire_zone_coords')
+    @field_validator('fire_zone_coords')
+    @classmethod
     def validate_coords(cls, v):
         if len(v) == 0:
             raise ValueError("At least one coordinate must be provided")
@@ -65,7 +67,7 @@ class SimulationResponse(BaseModel):
 
 class HealthCheckResponse(BaseModel):
     status: str
-    model_loaded: bool
+    sim_loaded: bool
     database_connected: bool
     timestamp: str
 
@@ -103,19 +105,44 @@ async def startup_event():
         
         city_graph_response = supabase.table("city_graph_structure").select("*").execute()
         city_graph = city_graph_response.data
-        logger.info(f"Loaded {len(city_graph)} city connections")
         
-        training_data_response = supabase.table("gnn_training_data").select("*").execute()
+        if not city_graph or len(city_graph) == 0:
+            logger.warning("city_graph_structure table is empty! Creating graph from training data...")
+            
+            training_data_response = supabase.table("gnn_training_data").select("*").limit(1000).execute()
+            training_data = pd.DataFrame(training_data_response.data)
+            
+            if 'created_at' in training_data.columns:
+                training_data['timestamp'] = pd.to_datetime(training_data['created_at'])
+            elif 'timestamp' in training_data.columns:
+                training_data['timestamp'] = pd.to_datetime(training_data['timestamp'])
+            else:
+                training_data['timestamp'] = datetime.now()
+            
+            city_graph = simulator.build_graph_from_data(training_data)
+        
+        logger.info(f"Loaded graph with {len(city_graph)} city connections")
+        
+        training_data_response = supabase.table("gnn_training_data").select("*").limit(1000).execute()
         training_data = pd.DataFrame(training_data_response.data)
         
-        training_data['timestamp'] = pd.to_datetime(training_data['timestamp'])
+        if 'created_at' in training_data.columns:
+            training_data['timestamp'] = pd.to_datetime(training_data['created_at'])
+        elif 'timestamp' in training_data.columns:
+            training_data['timestamp'] = pd.to_datetime(training_data['timestamp'])
+        else:
+            logger.warning("No timestamp column found, using current time")
+            training_data['timestamp'] = datetime.now()
+        
         num_cols = [
             "latitude", "longitude", "temperature", "humidity", "wind_speed",
             "avg_fire_confidence", "upwind_fire_count", "current_aqi",
             "population_density"
         ]
-        training_data[num_cols] = training_data[num_cols].apply(pd.to_numeric, errors='coerce')
-        training_data.dropna(inplace=True)
+        
+        existing_cols = [col for col in num_cols if col in training_data.columns]
+        training_data[existing_cols] = training_data[existing_cols].apply(pd.to_numeric, errors='coerce')
+        training_data.dropna(subset=existing_cols, inplace=True)
         
         logger.info(f"Loaded {len(training_data)} training data rows")
         
@@ -124,7 +151,7 @@ async def startup_event():
         logger.info("Simulator initialized successfully")
         
     except Exception as e:
-        logger.error(f"Startup failed: {str(e)}")
+        logger.error(f"Startup failed: {str(e)}", exc_info=True)
         raise
 
 
@@ -132,7 +159,7 @@ async def startup_event():
 async def health_check():
     return HealthCheckResponse(
         status="healthy",
-        model_loaded=simulator is not None,
+        sim_loaded=simulator is not None,
         database_connected=supabase_client is not None,
         timestamp=datetime.now().isoformat()
     )
@@ -165,19 +192,27 @@ async def simulate_haze(
         logger.info(f"Starting simulation with {len(request.fire_zone_coords)} fire zones")
         
         supabase = get_supabase_client()
-        response = supabase.table("gnn_training_data").select("*").execute()
+        response = supabase.table("gnn_training_data").select("*").limit(1000).execute()
         training_data = pd.DataFrame(response.data)
         
-        training_data['timestamp'] = pd.to_datetime(training_data['timestamp'])
+        if 'created_at' in training_data.columns:
+            training_data['timestamp'] = pd.to_datetime(training_data['created_at'])
+        elif 'timestamp' in training_data.columns:
+            training_data['timestamp'] = pd.to_datetime(training_data['timestamp'])
+        else:
+            training_data['timestamp'] = datetime.now()
+        
         num_cols = [
             "latitude", "longitude", "temperature", "humidity", "wind_speed",
             "wind_direction", "avg_fire_confidence", "upwind_fire_count", 
             "current_aqi", "population_density"
         ]
-        training_data[num_cols] = training_data[num_cols].apply(pd.to_numeric, errors='coerce')
-        training_data.dropna(inplace=True)
         
-        fire_coords = [coord.dict() for coord in request.fire_zone_coords]
+        existing_cols = [col for col in num_cols if col in training_data.columns]
+        training_data[existing_cols] = training_data[existing_cols].apply(pd.to_numeric, errors='coerce')
+        training_data.dropna(subset=existing_cols, inplace=True)
+        
+        fire_coords = [coord.model_dump() for coord in request.fire_zone_coords]
         
         result_df = sim.simulate_fire_zone(
             fire_zone_coords=fire_coords,
@@ -202,7 +237,7 @@ async def simulate_haze(
         )
         
     except Exception as e:
-        logger.error(f"Simulation failed: {str(e)}")
+        logger.error(f"Simulation failed: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Simulation failed: {str(e)}")
 
 
@@ -221,7 +256,7 @@ async def get_model_info(sim: HazeSimulator = Depends(get_simulator)):
         "model_type": "Graph Convolutional Network (GCN)",
         "input_features": sim.feature_cols,
         "num_cities": len(sim.node_cities),
-        "num_edges": sim.edge_index.shape[1] if sim.edge_index is not None else 0,
+        "num_edges": sim.edge_index.shape[1] if hasattr(sim, 'edge_index') and sim.edge_index is not None else 0,
         "device": str(sim.device)
     }
 
