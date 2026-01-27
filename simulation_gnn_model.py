@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
+from math import radians, sin, cos, sqrt, atan2
 import logging
 
 logging.basicConfig(level=logging.INFO)
@@ -52,6 +53,7 @@ class HazeSimulator:
         self.node_cities = []
         self.city_to_idx = {}
         self.adj_matrix = None
+        self.edge_index = None
         self.feature_cols = [
             "temperature", "humidity", "wind_speed", "wind_direction",
             "avg_fire_confidence", "upwind_fire_count", "current_aqi", "population_density"
@@ -70,6 +72,48 @@ class HazeSimulator:
             logger.error(f"Failed to load model: {str(e)}")
             raise
 
+    def build_graph_from_data(self, node_data: pd.DataFrame, max_distance_km: float = 150.0) -> List[Dict]:
+        """Build graph structure from city data when city_graph_structure is empty"""
+        logger.info("Building graph from training data...")
+        
+        cities_unique = node_data.groupby('city').agg({
+            'latitude': 'first',
+            'longitude': 'first'
+        }).reset_index()
+        
+        graph_data = []
+        
+        for idx, row in cities_unique.iterrows():
+            city = row['city']
+            lat1, lon1 = row['latitude'], row['longitude']
+            
+            connected_cities = []
+            distances = []
+            
+            for idx2, row2 in cities_unique.iterrows():
+                if idx == idx2:
+                    continue
+                
+                city2 = row2['city']
+                lat2, lon2 = row2['latitude'], row2['longitude']
+                
+                distance = self._haversine_distance(lat1, lon1, lat2, lon2)
+                
+                if distance <= max_distance_km:
+                    connected_cities.append(city2)
+                    distances.append(round(distance, 2))
+            
+            graph_data.append({
+                'city': city,
+                'latitude': lat1,
+                'longitude': lon1,
+                'connected_cities': ','.join(connected_cities),
+                'distances_km': ','.join(map(str, distances))
+            })
+        
+        logger.info(f"Built graph with {len(graph_data)} cities")
+        return graph_data
+
     def initialize_graph(self, city_graph: List[Dict], node_data: pd.DataFrame):
         try:
             self.node_cities = list(node_data['city'].unique())
@@ -86,7 +130,7 @@ class HazeSimulator:
                 
                 connected = connection.get('connected_cities', [])
                 if isinstance(connected, str):
-                    connected = [c.strip() for c in connected.split(',')]
+                    connected = [c.strip() for c in connected.split(',') if c.strip()]
                 
                 for c in connected:
                     c = str(c).strip()
@@ -107,11 +151,12 @@ class HazeSimulator:
             
             indices = np.nonzero(adj_normalized)
             values = adj_normalized[indices]
-            indices = torch.LongTensor(np.vstack(indices))
-            values = torch.FloatTensor(values)
+            indices_tensor = torch.LongTensor(np.vstack(indices))
+            values_tensor = torch.FloatTensor(values)
             shape = torch.Size(adj_normalized.shape)
             
-            self.adj_matrix = torch.sparse.FloatTensor(indices, values, shape).to(self.device)
+            self.adj_matrix = torch.sparse.FloatTensor(indices_tensor, values_tensor, shape).to(self.device)
+            self.edge_index = indices_tensor
             
             logger.info(f"Graph initialized with {num_nodes} nodes and {np.sum(adj_matrix > 0)} edges")
         except Exception as e:
